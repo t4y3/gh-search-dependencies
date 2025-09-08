@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# デフォルトの並列数（環境変数で変更可能）
+MAX_PARALLEL=${GH_SEARCH_MAX_PARALLEL:-10}
+SHOW_PROGRESS=false
+
+# 使用方法の表示
+show_usage() {
+  cat >&2 <<EOF
+Usage: gh-search-dependencies [OPTIONS] PACKAGE_NAME [OWNER]
+
+Options:
+  --progress    Show progress during search
+  --parallel N  Set max parallel requests (default: 10)
+  -h, --help    Show this help message
+
+Examples:
+  gh-search-dependencies react
+  gh-search-dependencies react my-org
+  gh-search-dependencies --progress react my-org
+
+Environment Variables:
+  GH_SEARCH_MAX_PARALLEL  Set default max parallel requests
+EOF
+  exit 1
+}
+
+# 引数解析
+POSITIONAL_ARGS=()
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --progress)
+      SHOW_PROGRESS=true
+      shift
+      ;;
+    --parallel)
+      MAX_PARALLEL="$2"
+      shift 2
+      ;;
+    -h|--help)
+      show_usage
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      show_usage
+      ;;
+    *)
+      POSITIONAL_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+# 位置引数を復元
+set -- "${POSITIONAL_ARGS[@]}"
+
+if [ $# -lt 1 ] || [ $# -gt 2 ]; then
+  show_usage
+fi
+
+pkg="$1"
+
+# 検索する owner（省略時は現在のリポジトリの owner を使用）
+if [ $# -eq 2 ]; then
+  owner="$2"
+else
+  remote_url=$(git config --get remote.origin.url || true)
+  if [ -z "${remote_url}" ]; then
+    echo "Error: Could not detect git remote.origin.url. Provide OWNER explicitly." >&2
+    exit 1
+  fi
+  # https/ssh 双方対応で owner/name を抽出
+  owner=$(echo "$remote_url" | perl -ne 'print $1 if m{github.com[:/]([\w\-]+)/[\w\-]+\.git$}')
+  if [ -z "${owner}" ]; then
+    echo "Error: Could not parse owner from remote URL: $remote_url" >&2
+    exit 1
+  fi
+fi
+
+# 一時ファイルの作成
+TEMP_DIR=$(mktemp -d)
+trap "rm -rf $TEMP_DIR" EXIT
+
+# 進捗表示用関数
+show_progress() {
+  if [ "$SHOW_PROGRESS" = true ]; then
+    echo "$@" >&2
+  fi
+}
+
+# text_matchesからバージョンを抽出する関数（高速モード）
+extract_version_from_matches() {
+  local matches="$1"
+  local pkg="$2"
+  
+  # text_matchesから該当パッケージのバージョンを探す
+  # "package": "version" の形式を探す（単語境界を考慮）
+  # パッケージ名の前後が引用符であることを確認して完全一致のみ取得
+  echo "$matches" | jq -r '.[] | .fragment' | \
+    grep -F "\"$pkg\"" | \
+    grep -E "\"$pkg\"[[:space:]]*:[[:space:]]*\"[^\"]+\"" | \
+    head -1 | \
+    sed -E "s/.*\"$pkg\"[[:space:]]*:[[:space:]]*\"([^\"]+)\".*/\1/" || true
+}
+
+
+# 結果を格納する一時ファイル
+RESULTS_FILE="$TEMP_DIR/results.csv"
+
+# GitHub Code Search を使用して検索
+search_scope="org:$owner"
+
+# text_matchesを使用した検索
+search_fast() {
+  local page=1
+  local per_page=100
+  local more=1
+  local total_found=0
+  
+  while [ $more -eq 1 ]; do
+    show_progress "Fetching search results page $page..."
+    
+    # API: GET /search/code with text-match
+    resp=$(gh api \
+      -H "Accept: application/vnd.github.text-match+json" \
+      --method GET \
+      "/search/code" \
+      -f q="\"\\\"$pkg\\\":\" in:file filename:package.json $search_scope" \
+      -f per_page="$per_page" \
+      -f page="$page" 2>/dev/null || true)
+
+    # 空や異常は終了
+    if [ -z "${resp}" ] || ! echo "$resp" | jq -e '.items' >/dev/null 2>&1; then
+      break
+    fi
+
+    count=$(echo "$resp" | jq -r '.items | length')
+    if [ "$count" = "0" ] || [ "$count" = "null" ]; then
+      break
+    fi
+    
+    show_progress "Processing $count items from page $page..."
+    
+    # 各アイテムを処理
+    for i in $(seq 0 $((count - 1))); do
+      item=$(echo "$resp" | jq ".items[$i]")
+      repo=$(echo "$item" | jq -r '.repository.full_name')
+      path=$(echo "$item" | jq -r '.path')
+      text_matches=$(echo "$item" | jq '.text_matches')
+      
+      # text_matchesからバージョンを抽出
+      version=$(extract_version_from_matches "$text_matches" "$pkg")
+      
+      if [ -n "$version" ]; then
+        printf "%s,%s,%s\n" "$repo" "$path" "$version" >> "$RESULTS_FILE"
+        total_found=$((total_found + 1))
+      else
+        # バージョンが見つからない場合でも、リポジトリとパスを出力（バージョンは空）
+        printf "%s,%s,%s\n" "$repo" "$path" "" >> "$RESULTS_FILE"
+      fi
+    done
+
+    # ページング
+    if [ "$count" -lt "$per_page" ]; then
+      more=0
+    else
+      page=$((page+1))
+    fi
+  done
+  
+  show_progress "Search complete. Found $total_found items with version info."
+}
+
+# 結果を整形して出力
+format_and_print_results() {
+  if [ ! -f "$RESULTS_FILE" ]; then
+    return
+  fi
+  
+  # ヘッダーを追加してソート
+  printf "%s,%s,%s\n" "repository" "path" "version"
+  sort "$RESULTS_FILE"
+}
+
+
+# メイン処理
+show_progress "Searching in $search_scope for package: $pkg"
+search_fast || { 
+  search_scope="user:$owner"
+  show_progress "Retrying with $search_scope..."
+  search_fast
+}
+
+# 結果を整形して出力
+format_and_print_results
